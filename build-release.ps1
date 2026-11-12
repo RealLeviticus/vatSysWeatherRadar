@@ -60,6 +60,19 @@ Plugins folder, for example:
   Documents\vatSys Files\Profiles\Australia\Plugins\WeatherRadarPlugin
 
 Restart vatSys after installing or replacing the plugin.
+
+The radar appears under Info > Weather Radar. By default it shows rain
+only inside your vis range; tick "Show All Radars" to see every radar.
+
+When vatSys downloads a new Australia profile version it can delete
+plugin folders that are not part of the profile, including this one.
+After a profile update, check the folder is still there and copy it
+back in if it has gone.
+
+The plugin downloads radar images from the Bureau of Meteorology's
+anonymous FTP service for your own personal use. Do not stream or
+otherwise republish the overlay. It is supplemental information only
+and must not be used for real-world or operational decisions.
 "@ | Set-Content -LiteralPath (Join-Path $distDir "INSTALL.txt") -Encoding UTF8
 
 $zipPath = Join-Path $distRoot "WeatherRadarPlugin-v$version.zip"

@@ -11,8 +11,6 @@ internal static class RadarImageDecoder
 {
     internal const int PlotSize = 512;
     internal const int PlotOffset = 6;
-    internal const int SamplePixels = 4;
-    internal const int GridSize = PlotSize / SamplePixels;
 
     // A BOM local radar image is 524x564 at most. Anything far larger is not a
     // radar product and is rejected before it can be locked into memory.
@@ -33,28 +31,32 @@ internal static class RadarImageDecoder
 
     private static readonly Dictionary<int, int> LevelByRgb = BuildLevelLookup();
 
-    /// <summary>An axis-aligned block of grid cells that all share one reflectivity level.</summary>
-    internal readonly struct CellRect
+    /// <summary>
+    /// A horizontal run of image pixels that all share one reflectivity level. Radar
+    /// images are mostly long runs, so this holds a whole image in a few kilobytes.
+    /// </summary>
+    internal readonly struct RainRun
     {
-        internal CellRect(int level, int row, int column, int rowEnd, int columnEnd)
+        internal RainRun(int row, int start, int end, int level)
         {
-            Level = level; Row = row; Column = column; RowEnd = rowEnd; ColumnEnd = columnEnd;
+            Row = (short)row; Start = (short)start; End = (short)end; Level = (sbyte)level;
         }
 
-        internal int Level { get; }
-        internal int Row { get; }
-        internal int Column { get; }
-        internal int RowEnd { get; }
-        internal int ColumnEnd { get; }
+        internal short Row { get; }
+        /// <summary>First pixel column of the run.</summary>
+        internal short Start { get; }
+        /// <summary>One past the last pixel column of the run.</summary>
+        internal short End { get; }
+        internal sbyte Level { get; }
     }
 
     /// <summary>
-    /// Samples a BOM radar image into the 2 km display grid, keeping the strongest return in
-    /// each cell, then merges same-level cells into the largest rectangles that fit. Merging
-    /// never changes which cells are painted, only how many polygons vatSys has to hold.
+    /// Reads every rain pixel of a BOM radar image at full resolution. Nothing is sampled
+    /// or merged here: combining radars and reducing to display cells happens in
+    /// <see cref="RadarMosaic"/>, which needs each pixel's own position to do it.
+    /// The result is bounded by the plot size, at most 512 rows of 256 runs.
     /// </summary>
-    /// <param name="maxCells">Hard ceiling on emitted rectangles, bounding worst-case memory.</param>
-    internal static List<CellRect> Decode(byte[] imageBytes, int maxCells)
+    internal static List<RainRun> Decode(byte[] imageBytes)
     {
         if (imageBytes is null || imageBytes.Length == 0)
             throw new InvalidDataException("BOM radar response was empty.");
@@ -73,91 +75,45 @@ internal static class RadarImageDecoder
         if (bitmap.Width < offset + PlotSize || bitmap.Height < offset + PlotSize)
             throw new InvalidDataException($"Unexpected BOM radar image size {bitmap.Width}x{bitmap.Height}.");
 
-        return MergeCells(SampleGrid(bitmap, offset), maxCells);
-    }
-
-    private static int[] SampleGrid(Bitmap bitmap, int offset)
-    {
-        var grid = new int[GridSize * GridSize];
-        for (var index = 0; index < grid.Length; index++) grid[index] = -1;
-
+        var runs = new List<RainRun>();
         // LockBits converts any source pixel format to 32bpp ARGB in one pass. GetPixel
         // would issue 262,144 individual GDI+ calls per radar, which alone was enough to
-        // saturate a core for minutes across 67 radars.
+        // saturate a core for minutes across the radar network.
         var region = new Rectangle(offset, offset, PlotSize, PlotSize);
         var data = bitmap.LockBits(region, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
             var row = new int[PlotSize];
-            // A fully transparent pixel is the correct seed: LevelOf(0) is also -1.
-            var lastArgb = 0;
-            var lastLevel = -1;
             for (var y = 0; y < PlotSize; y++)
             {
                 Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), row, 0, PlotSize);
-                var gridRow = (y / SamplePixels) * GridSize;
+                // A fully transparent pixel is the correct seed: LevelOf(0) is also -1.
+                var lastArgb = 0;
+                var lastLevel = -1;
+                var runStart = 0;
+                var runLevel = -1;
                 for (var x = 0; x < PlotSize; x++)
                 {
                     var argb = row[x];
-                    // Radar images are long runs of one colour, so memoising the previous
-                    // pixel avoids most of the per-pixel palette lookups.
+                    // Memoising the previous pixel avoids most of the palette lookups.
                     if (argb != lastArgb)
                     {
                         lastArgb = argb;
                         lastLevel = LevelOf(argb);
                     }
-                    if (lastLevel < 0) continue;
-                    var cell = gridRow + x / SamplePixels;
-                    if (lastLevel > grid[cell]) grid[cell] = lastLevel;
+                    if (lastLevel == runLevel) continue;
+                    if (runLevel >= 0) runs.Add(new RainRun(y, runStart, x, runLevel));
+                    runStart = x;
+                    runLevel = lastLevel;
                 }
+                if (runLevel >= 0) runs.Add(new RainRun(y, runStart, PlotSize, runLevel));
             }
         }
         finally
         {
             bitmap.UnlockBits(data);
         }
-        return grid;
-    }
-
-    private static List<CellRect> MergeCells(int[] grid, int maxCells)
-    {
-        var rects = new List<CellRect>();
-        var consumed = new bool[grid.Length];
-        for (var row = 0; row < GridSize; row++)
-        {
-            for (var column = 0; column < GridSize; column++)
-            {
-                var origin = row * GridSize + column;
-                if (consumed[origin]) continue;
-                var level = grid[origin];
-                if (level < 0) continue;
-                if (rects.Count >= maxCells) return rects;
-
-                var columnEnd = column + 1;
-                while (columnEnd < GridSize && !consumed[row * GridSize + columnEnd] &&
-                       grid[row * GridSize + columnEnd] == level)
-                    columnEnd++;
-
-                var rowEnd = row + 1;
-                while (rowEnd < GridSize && RowMatches(grid, consumed, rowEnd, column, columnEnd, level))
-                    rowEnd++;
-
-                for (var r = row; r < rowEnd; r++)
-                    for (var c = column; c < columnEnd; c++)
-                        consumed[r * GridSize + c] = true;
-
-                rects.Add(new CellRect(level, row, column, rowEnd, columnEnd));
-            }
-        }
-        return rects;
-    }
-
-    private static bool RowMatches(int[] grid, bool[] consumed, int row, int column, int columnEnd, int level)
-    {
-        var offset = row * GridSize;
-        for (var c = column; c < columnEnd; c++)
-            if (consumed[offset + c] || grid[offset + c] != level) return false;
-        return true;
+        return runs;
     }
 
     private static int LevelOf(int argb)

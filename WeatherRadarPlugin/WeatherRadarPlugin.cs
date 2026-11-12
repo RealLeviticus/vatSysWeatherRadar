@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel.Composition;
 using System.Drawing;
+using System.Reflection;
 using System.Windows.Forms;
 using vatsys;
 using vatsys.Plugin;
@@ -9,7 +10,7 @@ using VATSYSControls;
 namespace WeatherRadarPlugin;
 
 /// <summary>
-/// vatSys entry point and Tools-menu surface.
+/// vatSys entry point and menu surface.
 ///
 /// vatSys composes plugins through MEF and only guards that call against
 /// CompositionException, so a constructor that throws can take the client down before it
@@ -26,6 +27,7 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
     private readonly RadarOverlayService? _overlay;
     private readonly ToolStripMenuItem? _rootItem;
     private readonly ToolStripMenuItem? _showItem;
+    private readonly ToolStripMenuItem? _allRadarsItem;
     private readonly ToolStripMenuItem? _animateItem;
     private readonly ToolStripMenuItem? _pauseItem;
     private readonly ToolStripMenuItem? _transparencyLabel;
@@ -39,16 +41,21 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
         try
         {
             _overlay = new RadarOverlayService();
-            _showItem = new ToolStripMenuItem("Show All Local Radars")
+            _showItem = new ToolStripMenuItem("Show Weather Radar")
             {
                 CheckOnClick = true,
-                ToolTipText = "Display precipitation from all available BOM 128 km local radars"
+                ToolTipText = "Display BOM radar precipitation inside your vis range"
+            };
+            _allRadarsItem = new ToolStripMenuItem("Show All Radars")
+            {
+                CheckOnClick = true,
+                ToolTipText = "Display precipitation from every BOM radar, not just inside your vis range"
             };
             _animateItem = new ToolStripMenuItem("Animate Recent Scans")
             {
                 CheckOnClick = true,
                 Enabled = false,
-                ToolTipText = "Loop genuine BOM observations cached since vatSys started"
+                ToolTipText = "Loop the last half hour of BOM observations"
             };
             _pauseItem = new ToolStripMenuItem("Pause Animation")
             {
@@ -64,13 +71,16 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
             _transparencyDebounce = new System.Windows.Forms.Timer { Interval = 200 };
             _transparencyDebounce.Tick += TransparencyDebounceTick;
 
+            _overlay.MemoryLow += OverlayMemoryLow;
             _showItem.CheckedChanged += ShowItemCheckedChanged;
+            _allRadarsItem.CheckedChanged += AllRadarsItemCheckedChanged;
             _animateItem.CheckedChanged += AnimateItemCheckedChanged;
             _pauseItem.CheckedChanged += PauseItemCheckedChanged;
             _transparencySlider.ValueChanged += TransparencySliderValueChanged;
 
             _rootItem = new ToolStripMenuItem("Weather Radar");
             _rootItem.DropDownItems.Add(_showItem);
+            _rootItem.DropDownItems.Add(_allRadarsItem);
             _rootItem.DropDownItems.Add(new ToolStripSeparator());
             _rootItem.DropDownItems.Add(_animateItem);
             _rootItem.DropDownItems.Add(_pauseItem);
@@ -84,17 +94,55 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
                 Margin = new Padding(4, 0, 4, 4)
             });
 
-            _menuItem = new CustomToolStripMenuItem(
-                CustomToolStripMenuItemWindowType.Main,
-                CustomToolStripMenuItemCategory.Tools,
-                _rootItem);
+            _menuItem = CreateMenuEntry(_rootItem);
             MMI.AddCustomMenuItem(_menuItem);
+
+            // Fetching runs from here on, whether or not the overlay is ever shown, so
+            // switching it on has the picture and the recent rounds ready to draw.
+            _overlay.Start();
         }
         catch (Exception ex)
         {
             // vatSys must still start. Leave the plugin inert and surface the reason.
             _disposed = true;
             ReportSafely(ex);
+        }
+    }
+
+    /// <summary>
+    /// Puts the submenu in vatSys's Info menu, or in Tools if the Info menu cannot be found.
+    ///
+    /// vatSys's own Info category cannot be used: in build 0.4.9305 it looks for a
+    /// separator named "infoSeparator" in the Settings menu, finds none, and silently drops
+    /// the item. A custom category is looked up by control name instead, as
+    /// "{name}MenuItem", and the Info menu's control name is "aISToolStripMenuItem", so a
+    /// custom category called "aISToolStrip" lands in it. If that name ever stops matching,
+    /// vatSys would create a new top-level menu with that title, hence the check first.
+    /// </summary>
+    private static CustomToolStripMenuItem CreateMenuEntry(ToolStripMenuItem root)
+    {
+        return InfoMenuPresent()
+            ? new CustomToolStripMenuItem(CustomToolStripMenuItemWindowType.Main, InfoMenuCategory, root)
+            : new CustomToolStripMenuItem(
+                CustomToolStripMenuItemWindowType.Main, CustomToolStripMenuItemCategory.Tools, root);
+    }
+
+    private const string InfoMenuCategory = "aISToolStrip";
+
+    private static bool InfoMenuPresent()
+    {
+        try
+        {
+            // Plugins are constructed inside the main form's constructor, after its menu is
+            // built but before the form is shown, so Application.OpenForms cannot find it yet.
+            var form = typeof(MMI).GetField("MainForm", BindingFlags.NonPublic | BindingFlags.Static)
+                ?.GetValue(null) as Form;
+            var menu = form?.MainMenuStrip?.Items[InfoMenuCategory + "MenuItem"] as ToolStripMenuItem;
+            return menu is not null && string.Equals(menu.Text, "Info", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
@@ -110,7 +158,9 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
         _disposed = true;
         Guard(() =>
         {
+            if (_overlay is not null) _overlay.MemoryLow -= OverlayMemoryLow;
             if (_showItem is not null) _showItem.CheckedChanged -= ShowItemCheckedChanged;
+            if (_allRadarsItem is not null) _allRadarsItem.CheckedChanged -= AllRadarsItemCheckedChanged;
             if (_animateItem is not null) _animateItem.CheckedChanged -= AnimateItemCheckedChanged;
             if (_pauseItem is not null) _pauseItem.CheckedChanged -= PauseItemCheckedChanged;
             if (_transparencySlider is not null) _transparencySlider.ValueChanged -= TransparencySliderValueChanged;
@@ -148,16 +198,14 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
         return slider;
     }
 
-    private async void ShowItemCheckedChanged(object? sender, EventArgs e)
+    private void ShowItemCheckedChanged(object? sender, EventArgs e)
     {
-        // async void: an escaping exception here has no caller to observe it and would be
-        // raised on the GUI thread, so the whole body is guarded.
+        // Raised straight from the message loop, so nothing may escape.
         if (_disposed || _showItem is null || _overlay is null) return;
         var wanted = _showItem.Checked;
-        Guard(() => _showItem.Enabled = false);
         try
         {
-            await _overlay.SetEnabledAsync(wanted);
+            _overlay.SetVisible(wanted);
             if (_disposed) return;
             if (_animateItem is not null) _animateItem.Enabled = wanted;
             if (!wanted)
@@ -177,11 +225,24 @@ public sealed class WeatherRadarPlugin : IPlugin, IDisposable
             });
             ReportSafely(ex);
         }
-        finally
-        {
-            if (!_disposed) Guard(() => _showItem.Enabled = true);
-        }
     }
+
+    /// <summary>The overlay has already switched itself off; bring the menu back in step.</summary>
+    private void OverlayMemoryLow() => Guard(() =>
+    {
+        if (_disposed) return;
+        SetCheckedWithoutEvent(_showItem, false, ShowItemCheckedChanged);
+        SetCheckedWithoutEvent(_animateItem, false, AnimateItemCheckedChanged);
+        SetCheckedWithoutEvent(_pauseItem, false, PauseItemCheckedChanged);
+        if (_animateItem is not null) _animateItem.Enabled = false;
+        if (_pauseItem is not null) _pauseItem.Enabled = false;
+    });
+
+    private void AllRadarsItemCheckedChanged(object? sender, EventArgs e) => Guard(() =>
+    {
+        if (_disposed || _allRadarsItem is null || _overlay is null) return;
+        _overlay.SetShowAllRadars(_allRadarsItem.Checked);
+    });
 
     private void AnimateItemCheckedChanged(object? sender, EventArgs e) => Guard(() =>
     {

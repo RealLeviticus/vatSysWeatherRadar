@@ -9,10 +9,10 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <RootNamespace>WeatherRadarPlugin</RootNamespace>
     <AssemblyName>WeatherRadarPlugin</AssemblyName>
-    <Version>1.1.0.0</Version>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
-    <FileVersion>1.1.0.0</FileVersion>
-    <InformationalVersion>1.1.0.0</InformationalVersion>
+    <Version>1.2.0.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
+    <FileVersion>1.2.0.0</FileVersion>
+    <InformationalVersion>1.2.0.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <ProgramFilesX86 Condition="'$(ProgramFilesX86)' == ''">C:\Program Files (x86)</ProgramFilesX86>
     <VatSysDir Condition="'$(VatSysDir)' == ''">$(ProgramFilesX86)\vatSys</VatSysDir>
@@ -28,7 +28,6 @@
     </Reference>
     <Reference Include="System.ComponentModel.Composition" />
     <Reference Include="System.Drawing" />
-    <Reference Include="System.Net.Http" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="VATSYSControls">
       <HintPath>$(VatSysDir)\bin\VATSYSControls.dll</HintPath>
